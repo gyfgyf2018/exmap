@@ -18,6 +18,7 @@
 #include <linux/mmu_notifier.h>
 
 #include <linux/pgtable.h>
+#include <linux/pagemap.h>
 #include <asm/io.h>
 #include <asm/mmu_context.h>
 #include <asm/pgalloc.h>

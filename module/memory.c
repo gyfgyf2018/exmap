@@ -1,3 +1,8 @@
+#include <linux/mm.h>
+#include <linux/pgtable.h>
+#include <linux/vmstat.h>
+#include <linux/gfp.h>
+
 #include <linux/pgtable.h>
 #include <asm/io.h>
 #include <asm/mmu_context.h>
@@ -5,9 +10,184 @@
 #include <asm/cacheflush.h>
 #include <linux/memcontrol.h>
 
+#include "ksyms.h"
 #include "driver.h"
 #include "config.h"
 
+#define native_make_pte(x) __pte(x)
+
+
+static inline void __set_pte_at_ksym(struct mm_struct *mm, unsigned long addr,
+				pte_t *ptep, pte_t pte)
+{
+	if (pte_present(pte) && pte_user_exec(pte) && !pte_special(pte))
+		__sync_icache_dcache(pte);
+
+	/*
+	 * If the PTE would provide user space access to the tags associated
+	 * with it then ensure that the MTE tags are synchronised.  Although
+	 * pte_access_permitted() returns false for exec only mappings, they
+	 * don't expose tags (instruction fetches don't check tags).
+	 */
+	if (system_supports_mte() && pte_access_permitted(pte, false) &&
+	    !pte_special(pte)) {
+		pte_t old_pte = READ_ONCE(*ptep);
+		/*
+		 * We only need to synchronise if the new PTE has tags enabled
+		 * or if swapping in (in which case another mapping may have
+		 * set tags in the past even if this PTE isn't tagged).
+		 * (!pte_none() && !pte_present()) is an open coded version of
+		 * is_swap_pte()
+		 */
+		if (pte_tagged(pte) || (!pte_none(old_pte) && !pte_present(old_pte)))
+			mte_sync_tags_ksym(old_pte, pte);
+	}
+
+	__check_racy_pte_update(mm, ptep, pte);
+
+	set_pte(ptep, pte);
+}
+
+static inline void set_pte_at_ksym(struct mm_struct *mm, unsigned long addr,
+			      pte_t *ptep, pte_t pte)
+{
+	page_table_check_pte_set(mm, addr, ptep, pte);
+	return __set_pte_at_ksym(mm, addr, ptep, pte);
+}
+
+static inline bool ptlock_init_ksym(struct page *page)
+{
+	VM_BUG_ON_PAGE(*(unsigned long *)&page->ptl, page);
+	if (!ptlock_alloc_ksym(page))
+		return false;
+	spin_lock_init(ptlock_ptr(page));
+	return true;
+}
+
+static inline bool pmd_ptlock_init_ksym(struct page *page)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	page->pmd_huge_pte = NULL;
+#endif
+	return ptlock_init_ksym(page);
+}
+
+static inline bool pgtable_pmd_page_ctor_ksym(struct page *page)
+{
+	if (!pmd_ptlock_init_ksym(page))
+		return false;
+	__SetPageTable(page);
+	inc_lruvec_page_state(page, NR_PAGETABLE);
+	return true;
+}
+
+static inline void pmd_ptlock_free_ksym(struct page *page)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	VM_BUG_ON_PAGE(page->pmd_huge_pte, page);
+#endif
+	ptlock_free_ksym(page);
+}
+
+
+static inline void pgtable_pmd_page_dtor_ksym(struct page *page)
+{
+	pmd_ptlock_free_ksym(page);
+	__ClearPageTable(page);
+	dec_lruvec_page_state(page, NR_PAGETABLE);
+}
+
+static inline void pmd_free_ksym(struct mm_struct *mm, pmd_t *pmd)
+{
+	BUG_ON((unsigned long)pmd & (PAGE_SIZE-1));
+	pgtable_pmd_page_dtor_ksym(virt_to_page(pmd));
+	free_page((unsigned long)pmd);
+}
+
+static inline bool pgtable_pte_page_ctor_ksym(struct page *page)
+{
+	if (!ptlock_init_ksym(page))
+		return false;
+	__SetPageTable(page);
+	inc_lruvec_page_state(page, NR_PAGETABLE);
+	return true;
+}
+
+static inline void pgtable_pte_page_dtor_ksym(struct page *page)
+{
+	ptlock_free_ksym(page);
+	__ClearPageTable(page);
+	dec_lruvec_page_state(page, NR_PAGETABLE);
+}
+
+
+static inline void pte_free_ksym(struct mm_struct *mm, struct page *pte_page)
+{
+	pgtable_pte_page_dtor_ksym(pte_page);
+	__free_page(pte_page);
+}
+
+static inline bool in_swapper_pgdir_ksym(void *addr)
+{
+	return ((unsigned long)addr & PAGE_MASK) ==
+	        ((unsigned long)swapper_pg_dir_ksym & PAGE_MASK);
+}
+
+
+static inline void set_pud_ksym(pud_t *pudp, pud_t pud)
+{
+#ifdef __PAGETABLE_PUD_FOLDED
+	if (in_swapper_pgdir_ksym(pudp)) {
+		set_swapper_pgd_ksym((pgd_t *)pudp, __pgd(pud_val(pud)));
+		return;
+	}
+#endif /* __PAGETABLE_PUD_FOLDED */
+
+	WRITE_ONCE(*pudp, pud);
+
+	if (pud_valid(pud)) {
+		dsb(ishst);
+		isb();
+	}
+}
+
+static inline void __pud_populate_ksym(pud_t *pudp, phys_addr_t pmdp, pudval_t prot)
+{
+	set_pud_ksym(pudp, __pud(__phys_to_pud_val(pmdp) | prot));
+}
+
+static inline void pud_populate_ksym(struct mm_struct *mm, pud_t *pudp, pmd_t *pmdp)
+{
+	pudval_t pudval = PUD_TYPE_TABLE;
+
+	pudval |= (mm == init_mm_ksym) ? PUD_TABLE_UXN : PUD_TABLE_PXN;
+	__pud_populate_ksym(pudp, __pa(pmdp), pudval);
+}
+
+static inline void set_p4d_ksym(p4d_t *p4dp, p4d_t p4d)
+{
+	if (in_swapper_pgdir_ksym(p4dp)) {
+		set_swapper_pgd_ksym((pgd_t *)p4dp, __pgd(p4d_val(p4d)));
+		return;
+	}
+
+	WRITE_ONCE(*p4dp, p4d);
+	dsb(ishst);
+	isb();
+}
+
+static inline void __p4d_populate_ksym(p4d_t *p4dp, phys_addr_t pudp, p4dval_t prot)
+{
+	set_p4d_ksym(p4dp, __p4d(__phys_to_p4d_val(pudp) | prot));
+}
+
+static inline void p4d_populate_ksym(struct mm_struct *mm, p4d_t *p4dp, pud_t *pudp)
+{
+	p4dval_t p4dval = P4D_TYPE_TABLE;
+
+	p4dval |= (mm == init_mm_ksym) ? P4D_TABLE_UXN : P4D_TABLE_PXN;
+	__p4d_populate_ksym(p4dp, __pa(pudp), p4dval);
+}
 
 /**
  * exmap_pte_alloc_one - allocate a page for PTE-level user page table
@@ -28,7 +208,7 @@ static inline pgtable_t exmap_pte_alloc_one(struct mm_struct *mm)
 	pte = alloc_page(GFP_PGTABLE_USER);
 	if (!pte)
 		return NULL;
-	if (!pgtable_pte_page_ctor(pte)) {
+	if (!pgtable_pte_page_ctor_ksym(pte)) {
 		__free_page(pte);
 		return NULL;
 	}
@@ -70,7 +250,7 @@ int exmap__pte_alloc(struct mm_struct *mm, pmd_t *pmd)
 
 	pmd_install(mm, pmd, &new);
 	if (new)
-		pte_free(mm, new);
+		pte_free_ksym(mm, new);
 	return 0;
 }
 
@@ -94,7 +274,7 @@ static inline pmd_t *exmap_pmd_alloc_one(struct mm_struct *mm, unsigned long add
 	page = alloc_pages(GFP_PGTABLE_USER, 0);
 	if (!page)
 		return NULL;
-	if (!pgtable_pmd_page_ctor(page)) {
+	if (!pgtable_pmd_page_ctor_ksym(page)) {
 		__free_pages(page, 0);
 		return NULL;
 	}
@@ -162,7 +342,7 @@ int exmap_default_pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long addr
 	if (!p4d_present(*p4d)) {
 		mm_inc_nr_puds(mm);
 		smp_wmb(); /* See comment in pmd_install() */
-		p4d_populate(mm, p4d, new);
+		p4d_populate_ksym(mm, p4d, new);
 	} else  /* Another has populated it */
 		pud_free(mm, new);
 	spin_unlock(&mm->page_table_lock);
@@ -189,9 +369,9 @@ int exmap_default_pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long addr
 	if (!pud_present(*pud)) {
 		mm_inc_nr_pmds(mm);
 		smp_wmb(); /* See comment in pmd_install() */
-		pud_populate(mm, pud, new);
+		pud_populate_ksym(mm, pud, new);
 	} else {    /* Another has populated it */
-		pmd_free(mm, new);
+		pmd_free_ksym(mm, new);
 	}
 	spin_unlock(ptl);
 #endif /* __PAGETABLE_PMD_FOLDED */
@@ -290,7 +470,7 @@ static int insert_page_into_pte_locked(struct mm_struct *mm, pte_t *pte,
 	BUG_ON(mapcount != 1);
 #endif
 
-	set_pte_at(mm, addr, pte, mk_pte(page, prot));
+	set_pte_at_ksym(mm, addr, pte, mk_pte(page, prot));
 	return 0;
 }
 
