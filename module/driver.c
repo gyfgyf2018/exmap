@@ -1170,8 +1170,10 @@ static int dev_uevent_perms(struct device *dev, struct kobj_uevent_env *env) {
 }
 
 static int exmap_init_module(void) {
-	if (exmap_acquire_ksyms())
+	if (exmap_acquire_ksyms()){
+		printk(KERN_INFO "exmap acquire ksyms failed\n");
 		goto out;
+	}
 
 	if (alloc_chrdev_region(&first, 0, 1, "exmap") < 0)
 		goto out;
@@ -1185,7 +1187,7 @@ static int exmap_init_module(void) {
 	if (cdev_add(&cdev, first, 1) == -1)
 		goto out_device_destroy;
 
-	printk(KERN_INFO "exmap registered");
+	printk(KERN_INFO "exmap registered\n");
 
 	return 0;
 

@@ -57,8 +57,10 @@ int exmap_acquire_ksyms(void)
 	// flush_tlb_mm_range_ksym = (void *)kallsyms_lookup_name("flush_tlb_mm_range");
 	// if(!flush_tlb_mm_range_ksym)
 	// 	return -1;
+#if ALLOC_SPLIT_PTLOCKS
 	KLN(ptlock_alloc);
 	KLN(ptlock_free);
+#endif
 	KLN(swapper_pg_dir);
 	KLN(set_swapper_pgd);
 	KLN(init_mm);

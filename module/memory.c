@@ -16,6 +16,10 @@
 
 #define native_make_pte(x) __pte(x)
 
+#if !ALLOC_SPLIT_PTLOCKS
+#define ptlock_alloc_ksym ptlock_alloc
+#define ptlock_free_ksym ptlock_free
+#endif
 
 static inline void __set_pte_at_ksym(struct mm_struct *mm, unsigned long addr,
 				pte_t *ptep, pte_t pte)

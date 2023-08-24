@@ -6,4 +6,8 @@ module:
 eval:
 	make -C eval/
 
-.PHONY: module eval
+clean:
+	make -C module/ clean
+	make -C eval/ clean
+
+.PHONY: module eval clean
